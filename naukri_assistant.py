@@ -233,6 +233,62 @@ def solve_naukri_chatbot(page, profile):
         except Exception:
             pass
 
+        # Step 2.5: If 'Skip this question' is visible inside the drawer, skip immediately and move to the next question
+        skip_el = None
+        try:
+            candidates = drawer.query_selector_all("button, .chip, div[class*='chip' i], div[class*='skip' i], span, a, li")
+            for cand in candidates:
+                try:
+                    if not cand.is_visible():
+                        continue
+                    ct = cand.inner_text().strip().lower()
+                    if ct in ["skip this question", "skip question", "skip"]:
+                        skip_el = cand  # keep innermost/last matching visible element
+                except:
+                    pass
+        except:
+            pass
+
+        if skip_el:
+            skip_state = f"skip:{question_text}"
+            if skip_state == last_answered_state:
+                stuck_rounds += 1
+                if stuck_rounds >= 3:
+                    print("  [!] Clicking 'Skip this question' did not advance chatbot. Aborting.")
+                    return False
+            else:
+                stuck_rounds = 0
+            last_answered_state = skip_state
+
+            print(f"  [AI] Found 'Skip this question' for '{question_text[:60]}'. Skipping to next question...")
+            try:
+                skip_el.click()
+            except:
+                try:
+                    skip_el.click(force=True)
+                except:
+                    try:
+                        skip_el.evaluate("el => el.click()")
+                    except:
+                        pass
+            time.sleep(2.0)
+
+            # Check if Save became enabled or drawer closed after skipping
+            try:
+                final_body = page.inner_text("body").lower() if page else ""
+                if any(s in final_body for s in ["successfully applied", "applied successfully", "application submitted"]):
+                    print("  [✓] Application completed successfully!")
+                    return True
+                new_drawer, _ = find_active_drawer(page)
+                if not new_drawer:
+                    print("  [✓] Drawer closed after skipping. Application submitted!")
+                    return True
+                if stuck_rounds >= 1:
+                    click_save_if_present(page, new_drawer)
+            except:
+                pass
+            continue
+
         # Step 3: Handle RADIO BUTTONS & OPTION CONTAINERS strictly inside `drawer`
         radio_groups_answered = 0
         try:
@@ -269,16 +325,18 @@ def solve_naukri_chatbot(page, profile):
                 });
 
                 for (const [name, rList] of Object.entries(byName)) {
+                    const anyVisible = rList.some(r => r.offsetParent !== null || (r.parentElement && r.parentElement.offsetParent !== null));
+                    if (!anyVisible) continue;
                     const isChecked = rList.some(r => r.checked);
                     let qText = '';
-                    // Look upward from first radio's group container for the closest question text
+                    // Look upward from first radio's group container for the closest visible question text
                     const grpCont = rList[0].closest('fieldset, .radio-group, div[class*="question" i], div[class*="option" i], ul, div');
                     if (grpCont) {
-                        const legend = grpCont.querySelector('legend, label[class*="question" i], div[class*="question" i], p');
-                        if (legend && !legend.querySelector("input") && !isGreeting(legend.innerText.trim())) {
+                        const legend = grpCont.querySelector('legend, label[class*="question" i], div[class*="question" i], .botMsg, div[class*="bot" i], p');
+                        if (legend && legend.offsetParent !== null && !legend.querySelector("input") && !isGreeting(legend.innerText.trim())) {
                             qText = legend.innerText.trim();
                         }
-                        if (!qText && grpCont.previousElementSibling) {
+                        if (!qText && grpCont.previousElementSibling && grpCont.previousElementSibling.offsetParent !== null) {
                             const pt = grpCont.previousElementSibling.innerText.trim();
                             if (!isGreeting(pt)) qText = pt;
                         }

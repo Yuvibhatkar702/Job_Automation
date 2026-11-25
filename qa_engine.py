@@ -164,10 +164,8 @@ def answer_hr_question(question: str, options: list = None) -> str:
         if any(k in q_lower for k in ["expected monthly salary", "expected salary per month"]):
             return "30000"
         if any(k in q_lower for k in ["current ctc", "current salary", "present ctc"]):
-            return "0"
+            return "300000"
         if any(k in q_lower for k in ["expected ctc", "expected salary", "desired salary"]):
-            if any(u in q_lower for u in ["lac", "lakh", "lpa"]):
-                return "3.5"
             return "350000"
 
     cached = get_cached_answer(question)
@@ -255,7 +253,7 @@ def get_smart_fallback(question, options=None):
     if any(k in q for k in ["expected monthly salary", "expected salary per month"]):
         return "30000"
     if any(k in q for k in ["current ctc", "current salary", "present ctc"]):
-        return "0"
+        return "300000"
     if any(k in q for k in ["expected ctc", "expected salary", "package"]):
         return "350000"
     if any(k in q for k in ["notice period", "notice"]):
