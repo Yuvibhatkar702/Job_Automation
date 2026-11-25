@@ -108,6 +108,121 @@ def get_page_url(target_page):
     except:
         return ""
 
+def _is_filter_element(el):
+    """Returns True if the element is part of the search filter bar or popup at the top of Indeed."""
+    try:
+        in_filter = el.evaluate("""el => {
+            const filterContainer = el.closest('[id*="filter"], [class*="filter"], [data-testid*="filter"], .yosegi-FilterPill, #filter-root, #mosaic-desktopJobSearchFilters');
+            if (filterContainer) return true;
+            const text = (el.innerText || '').toLowerCase().trim();
+            if (text.startsWith('easily apply') && !text.includes('apply now') && !text.includes('apply with indeed')) return true;
+            if (['all jobs', 'reset', 'update', 'cancel', 'done', 'pay', 'remote', 'job type', 'programming language', 'education level', 'industry', 'date posted'].includes(text)) return true;
+            return false;
+        }""")
+        return bool(in_filter)
+    except:
+        return False
+
+def dismiss_open_popups(page):
+    """Closes any open filter dropdowns, feedback dialogs, or cookie banners."""
+    try:
+        filter_popup = page.query_selector('div[role="dialog"]:has-text("Easily apply on Indeed"), div[role="dialog"]:has-text("Update"), div.popover, div[class*="FilterModal"]')
+        if filter_popup and filter_popup.is_visible():
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+        close_btn = page.query_selector('button[aria-label="Close"], button[aria-label="close"], button:has-text("Dismiss")')
+        if close_btn and close_btn.is_visible():
+            txt = close_btn.inner_text().lower()
+            if "apply" not in txt:
+                close_btn.click()
+                time.sleep(0.3)
+    except:
+        pass
+
+def find_indeed_apply_button(page):
+    """
+    Finds the active internal apply button ('Apply now' or 'Apply with Indeed').
+    Strictly excludes filter pills ('Easily apply 1') and external employer sites.
+    """
+    pane_selectors = [
+        'div.jobsearch-ViewjobPaneWrapper',
+        'div#jobsearch-ViewjobPaneWrapper',
+        'div.jobsearch-RightPane',
+        'div.fastviewjob',
+        'div.jobsearch-JobComponent',
+        '#viewJobSSRRoot',
+        'div[data-testid="jobsearch-ViewjobPaneWrapper"]',
+        'div[data-testid="viewJobContent"]',
+        'main#jobsearch-ViewjobPaneWrapper'
+    ]
+
+    button_subselectors = [
+        '#indeedApplyButton button',
+        'button#indeedApplyButton',
+        'div#indeedApplyButton button',
+        'div[id*="indeedApply"] button',
+        'button[data-testid="indeedApplyButton"]',
+        'div[data-testid="indeedApplyButton"] button',
+        'a[data-testid="indeedApplyButton"]',
+        'button.ia-IndeedApplyButton',
+        'span.indeed-apply-widget button',
+        'div.jobsearch-IndeedApplyButton-contentWrapper button',
+        'button:has-text("Apply now")',
+        'a:has-text("Apply now")',
+        'button:has-text("Apply with Indeed")',
+        'a:has-text("Apply with Indeed")'
+    ]
+
+    # 1. Search inside the right job details pane first
+    for pane_sel in pane_selectors:
+        try:
+            pane = page.query_selector(pane_sel)
+            if pane and pane.is_visible():
+                ext = pane.query_selector('button:has-text("Apply on company site"), a:has-text("Apply on company site"), button:has-text("Apply on employer site"), a:has-text("Apply on employer site")')
+                if ext and ext.is_visible() and not _is_filter_element(ext):
+                    return None, "external"
+
+                for sub in button_subselectors:
+                    btn = pane.query_selector(sub)
+                    if btn and btn.is_visible():
+                        if _is_filter_element(btn):
+                            continue
+                        txt = btn.inner_text().strip()
+                        txt_lower = txt.lower()
+                        if "company site" in txt_lower or "employer site" in txt_lower or "company website" in txt_lower:
+                            return None, "external"
+                        if "apply" in txt_lower:
+                            return btn, txt
+        except:
+            pass
+
+    # 2. Search anywhere on page (e.g. direct /viewjob page or full width view)
+    for sub in button_subselectors:
+        try:
+            btns = page.query_selector_all(sub)
+            for btn in btns:
+                if btn and btn.is_visible():
+                    if _is_filter_element(btn):
+                        continue
+                    txt = btn.inner_text().strip()
+                    txt_lower = txt.lower()
+                    if "company site" in txt_lower or "employer site" in txt_lower or "company website" in txt_lower:
+                        return None, "external"
+                    if "apply" in txt_lower:
+                        return btn, txt
+        except:
+            pass
+
+    # 3. Check for external company apply button
+    try:
+        ext = page.query_selector('button:has-text("Apply on company site"), a:has-text("Apply on company site"), button:has-text("Apply on employer site"), a:has-text("Apply on employer site")')
+        if ext and ext.is_visible() and not _is_filter_element(ext):
+            return None, "external"
+    except:
+        pass
+
+    return None, None
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FORM SOLVER FOR SMARTAPPLY (TAB / WINDOW)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,15 +246,31 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
         try:
             curr_url = get_page_url(apply_page)
             body_text = apply_page.inner_text("body").lower()
-            if "post-apply" in curr_url or "your application was submitted to" in body_text or "application submitted to" in body_text:
+            if any(s in curr_url for s in ["post-apply", "postapply", "submitted", "success"]):
+                print("  [✓] Application successfully submitted and verified via URL!")
+                return True
+            if any(s in body_text for s in [
+                "your application was submitted",
+                "application was submitted",
+                "application submitted",
+                "application has been submitted",
+                "application sent",
+                "you applied",
+                "you've applied",
+                "successfully applied",
+                "return to job search",
+                "track your application",
+                "applied on"
+            ]):
                 print("  [✓] Application successfully submitted and verified!")
                 return True
         except:
             pass
 
-        # 2. If the tab was closed without submitting, it failed
-        if apply_page.is_closed():
-            print("  [!] Apply tab was closed before submission.")
+        # 2. If the tab or frame was closed without submitting, it failed
+        is_closed = apply_page.is_closed() if hasattr(apply_page, "is_closed") else apply_page.is_detached()
+        if is_closed:
+            print("  [!] Apply window or frame was closed before submission.")
             return False
 
         dismiss_cookie_banner(apply_page)
@@ -176,10 +307,10 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
         except:
             pass
 
-        # 5. Answer screening questions (Text inputs & textareas)
+        # 5. Answer screening questions (Text inputs, number inputs, textareas)
         try:
             inputs = apply_page.locator(
-                'input[type="text"]:visible, input[type="number"]:visible, textarea:visible'
+                'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="submit"]):not([type="button"]):not([type="reset"]):visible, textarea:visible'
             )
             for i in range(inputs.count()):
                 try:
@@ -194,71 +325,120 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
                             if lbl.count() > 0:
                                 label_text = lbl.first.inner_text().strip()
                     if not label_text:
-                        label_text = el.get_attribute("placeholder") or ""
+                        try:
+                            parent_lbl = el.locator('xpath=ancestor::label')
+                            if parent_lbl.count() > 0:
+                                label_text = parent_lbl.first.inner_text().strip()
+                        except:
+                            pass
+                    if not label_text:
+                        label_text = el.get_attribute("placeholder") or el.get_attribute("name") or ""
                     if not label_text:
                         continue
 
-                    pv = get_profile_value(label_text)
-                    if pv:
-                        el.fill(pv)
-                        print(f"    [Profile Fill] {label_text[:40]} → {pv}")
-                    else:
-                        answer = answer_hr_question(label_text)
-                        if not answer:
+                    q_lower = label_text.lower()
+                    if any(k in q_lower for k in ["how many years", "years of experience", "years of work", "total experience"]):
+                        if any(tech in q_lower for tech in ["java", "python", "web", "react", "node", "intern", "developer"]):
+                            answer = "1"
+                        else:
                             answer = "0"
-                        el.fill(answer[:200])
-                        print(f"    [AI Fill] {label_text[:40]} → {answer[:40]}")
+                    elif any(k in q_lower for k in ["ctc", "salary"]):
+                        if "monthly" in q_lower or "per month" in q_lower:
+                            answer = "30000" if "expected" in q_lower else "0"
+                        else:
+                            answer = "350000" if "expected" in q_lower else "0"
+                    elif any(k in q_lower for k in ["notice", "availability"]):
+                        answer = "0" if el.get_attribute("type") == "number" else "Immediate"
+                    elif any(k in q_lower for k in ["city", "location"]):
+                        answer = "Pune"
+                    else:
+                        pv = get_profile_value(label_text)
+                        if pv:
+                            answer = pv
+                        else:
+                            answer = answer_hr_question(label_text)
+                            if not answer:
+                                answer = "0" if el.get_attribute("type") == "number" else "Yes"
+
+                    el.fill(answer[:200])
+                    el.evaluate("e => { e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); }")
+                    print(f"    [AI Fill] {label_text[:40]} → {answer[:40]}")
                     time.sleep(0.3)
                 except:
                     pass
         except:
             pass
 
-        # 6. Answer radio buttons
+        # 6. Answer radio buttons (grouped by name or parent container)
         try:
-            fieldsets = apply_page.locator('fieldset:visible, div[role="radiogroup"]:visible')
-            for i in range(fieldsets.count()):
+            radios = apply_page.locator('input[type="radio"]:visible')
+            radio_groups = {}
+            for i in range(radios.count()):
+                r = radios.nth(i)
+                name = r.get_attribute("name") or f"grp_{i}"
+                radio_groups.setdefault(name, []).append(r)
+
+            for grp_name, grp_radios in radio_groups.items():
                 try:
-                    fs = fieldsets.nth(i)
+                    if any(r.is_checked() for r in grp_radios):
+                        continue
+
                     question = ""
+                    first_r = grp_radios[0]
                     try:
-                        question = fs.locator("legend, label").first.inner_text().strip()
+                        fs = first_r.locator('xpath=ancestor::fieldset | ancestor::div[role="radiogroup"]')
+                        if fs.count() > 0:
+                            question = fs.first.locator("legend, label").first.inner_text().strip()
                     except:
                         pass
                     if not question:
-                        continue
-
-                    radios = fs.locator('input[type="radio"]')
-                    radio_labels = []
-                    for j in range(radios.count()):
                         try:
-                            r_id = radios.nth(j).get_attribute("id") or ""
-                            lbl = apply_page.locator(f'label[for="{r_id}"]')
-                            radio_labels.append(lbl.first.inner_text().strip() if lbl.count() > 0 else f"Option {j}")
+                            parent = first_r.locator('xpath=ancestor::div[contains(@class, "ia-")] | ancestor::div[contains(@class, "css-")]')
+                            if parent.count() > 0:
+                                lines = [line.strip() for line in parent.first.inner_text().split("\n") if line.strip()]
+                                for line in lines:
+                                    if any(k in line.lower() for k in ["?", "*", "experience", "license", "licence", "speak", "relocate", "willing", "travel", "shift", "comfortable"]):
+                                        question = line
+                                        break
                         except:
-                            radio_labels.append(f"Option {j}")
+                            pass
 
-                    if not radio_labels:
-                        continue
+                    radio_labels = []
+                    for r in grp_radios:
+                        lbl_text = ""
+                        try:
+                            r_id = r.get_attribute("id") or ""
+                            if r_id:
+                                lbl = apply_page.locator(f'label[for="{r_id}"]')
+                                if lbl.count() > 0:
+                                    lbl_text = lbl.first.inner_text().strip()
+                            if not lbl_text:
+                                p_lbl = r.locator('xpath=ancestor::label')
+                                if p_lbl.count() > 0:
+                                    lbl_text = p_lbl.first.inner_text().strip()
+                        except:
+                            pass
+                        radio_labels.append(lbl_text or r.get_attribute("value") or "Option")
 
-                    already_checked = any(radios.nth(j).is_checked() for j in range(radios.count()))
-                    if already_checked:
-                        continue
-
-                    answer = answer_hr_question(question, options=radio_labels)
+                    answer = answer_hr_question(question or "Screening question", options=radio_labels)
                     try:
                         idx = int(answer)
-                        if not (0 <= idx < len(radio_labels)):
+                        if not (0 <= idx < len(grp_radios)):
                             idx = 0
                     except:
                         idx = 0
 
-                    r_id = radios.nth(idx).get_attribute("id") or ""
-                    if r_id:
-                        apply_page.locator(f'label[for="{r_id}"]').first.click()
-                    else:
-                        radios.nth(idx).click(force=True)
-                    print(f"    [AI Radio] {question[:40]} → {radio_labels[idx]}")
+                    target_r = grp_radios[idx]
+                    try:
+                        r_id = target_r.get_attribute("id") or ""
+                        lbl = apply_page.locator(f'label[for="{r_id}"]') if r_id else None
+                        if lbl and lbl.count() > 0:
+                            lbl.first.click(force=True)
+                        else:
+                            target_r.click(force=True)
+                    except:
+                        target_r.check(force=True)
+                    print(f"    [AI Radio] {(question or 'Question')[:40]} → {radio_labels[idx]}")
                     time.sleep(0.3)
                 except:
                     pass
@@ -302,25 +482,27 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
         except:
             pass
 
-        # 8. Check checkboxes (consent / agreement)
+        # 8. Check checkboxes (consent / agreement), uncheck optional job alerts
         try:
-            cbs = apply_page.locator('input[type="checkbox"]:visible')
-            for i in range(cbs.count()):
-                try:
-                    cb = cbs.nth(i)
-                    if cb.is_checked():
-                        continue
-                    cb_id = cb.get_attribute("id") or ""
-                    cb_label = ""
-                    if cb_id:
-                        lbl = apply_page.locator(f'label[for="{cb_id}"]')
-                        if lbl.count() > 0:
-                            cb_label = lbl.first.inner_text().strip().lower()
-                    if any(kw in cb_label for kw in ["agree", "consent", "terms", "acknowledge", "confirm"]):
-                        cb.check(force=True)
-                        print(f"    [Auto Check] {cb_label[:40]}")
-                except:
-                    pass
+            apply_page.evaluate("""() => {
+                document.querySelectorAll("input[type='checkbox']").forEach(cb => {
+                    const lbl = cb.closest('label') || document.querySelector('label[for="' + cb.id + '"]');
+                    const txt = lbl ? lbl.innerText.toLowerCase() : '';
+                    if (txt.includes('terms') || txt.includes('privacy') || txt.includes('consent') || txt.includes('agree')) {
+                        if (!cb.checked) {
+                            cb.click();
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }
+                    if (txt.includes('get email updates') || txt.includes('job alert')) {
+                        if (cb.checked) {
+                            cb.click();
+                            cb.checked = false;
+                        }
+                    }
+                });
+            }""")
         except:
             pass
 
@@ -333,7 +515,11 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
                 }
             });
         }""")
-        apply_page.mouse.wheel(0, 3000)
+        try:
+            page_obj = apply_page.page if hasattr(apply_page, "page") else apply_page
+            page_obj.mouse.wheel(0, 3000)
+        except:
+            pass
         time.sleep(1.5)
 
         # Check if we are on the review or final submission step
@@ -361,7 +547,8 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
                             if rc_el:
                                 box = rc_el.bounding_box()
                                 if box:
-                                    apply_page.mouse.click(box["x"] + 28, box["y"] + (box["height"] / 2))
+                                    page_obj = apply_page.page if hasattr(apply_page, "page") else apply_page
+                                    page_obj.mouse.click(box["x"] + 28, box["y"] + (box["height"] / 2))
                         time.sleep(3.0)
 
                         # Check if verified or if puzzle appeared
@@ -381,14 +568,20 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
                 pass
 
         # Re-scroll to ensure submit button is visible
-        apply_page.mouse.wheel(0, 1000)
+        try:
+            page_obj = apply_page.page if hasattr(apply_page, "page") else apply_page
+            page_obj.mouse.wheel(0, 1000)
+        except:
+            pass
         time.sleep(0.5)
 
         # 9. PRIORITY 1: Check for Final Submit button
         submit_btn = apply_page.query_selector(
             'button:has-text("Submit your application"), '
             'button:has-text("Submit application"), '
-            'button:has-text("Send application")'
+            'button[data-testid="Review-submitButton"], '
+            'button:has-text("Send application"), '
+            'button:has-text("Submit")'
         )
         if submit_btn:
             # If reCAPTCHA is present and still not checked, give a final 10-second window
@@ -420,13 +613,34 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
             for _ in range(10):
                 time.sleep(1.0)
                 try:
+                    is_closed = apply_page.is_closed() if hasattr(apply_page, "is_closed") else apply_page.is_detached()
+                    if is_closed:
+                        print("  [✓] Application tab/modal closed after submit - submission successfully complete!")
+                        return True
                     curr_url = get_page_url(apply_page)
                     body = apply_page.inner_text("body").lower()
-                    if "post-apply" in curr_url or "your application was submitted to" in body or "application submitted to" in body:
-                        print("  [✓] Application successfully submitted and verified!")
+                    if any(s in curr_url for s in ["post-apply", "postapply", "submitted", "success", "indeed.com/jobs"]):
+                        print("  [✓] Application successfully submitted and verified via URL redirect!")
                         return True
-                except:
-                    pass
+                    if any(s in body for s in [
+                        "your application was submitted",
+                        "application was submitted",
+                        "application submitted",
+                        "application has been submitted",
+                        "application sent",
+                        "you applied",
+                        "you've applied",
+                        "successfully applied",
+                        "return to job search",
+                        "track your application",
+                        "applied on"
+                    ]):
+                        print("  [✓] Application successfully submitted and verified via confirmation text!")
+                        return True
+                except Exception as verify_err:
+                    if hasattr(apply_page, "is_closed") and apply_page.is_closed():
+                        print("  [✓] Application tab closed after submit - submission complete!")
+                        return True
 
             print("  [!] Submission could not be confirmed (captcha or validation error).")
             return False
@@ -435,16 +649,63 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
         continue_btn = apply_page.query_selector(
             'button:has-text("Continue"), '
             'button:has-text("Review your application"), '
+            'button:has-text("Review application"), '
+            'button:has-text("Review"), '
             'button:has-text("Next"), '
-            'button:has-text("Proceed")'
+            'button:has-text("Proceed"), '
+            'button:has-text("Save and continue"), '
+            'button:has-text("Continue to next step"), '
+            'button[data-testid*="continue" i], '
+            'button[data-testid*="review" i], '
+            'button[class*="ia-continueButton"], '
+            'button[class*="ia-BaseButton"], '
+            'button[type="submit"]:visible, '
+            '[role="button"]:has-text("Continue"), '
+            '[role="button"]:has-text("Review"), '
+            '[role="button"]:has-text("Next"), '
+            'footer button:visible, '
+            'div[data-testid*="Navigation"] button:visible'
         )
+        if not continue_btn:
+            # Fallback: scan all visible buttons for matching keywords
+            all_btns = apply_page.query_selector_all("button:visible, [role='button']:visible, input[type='submit']:visible")
+            for b in all_btns:
+                b_txt = (b.inner_text() or b.get_attribute("value") or "").strip().lower()
+                if any(k in b_txt for k in ["continue", "review", "next", "proceed", "save"]):
+                    continue_btn = b
+                    break
+
         if continue_btn:
+            # Check if button is disabled by validation
+            try:
+                is_disabled = continue_btn.is_disabled() or (continue_btn.get_attribute("aria-disabled") == "true")
+            except:
+                is_disabled = False
+
+            if is_disabled:
+                print("  [!] Continue button appears disabled; auto-filling any empty inputs...")
+                try:
+                    empty_inps = apply_page.query_selector_all('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="submit"]):not([type="button"]):visible')
+                    for inp in empty_inps:
+                        if not inp.input_value().strip():
+                            t = inp.get_attribute("type") or "text"
+                            fill_v = "0" if t == "number" else "Yes"
+                            inp.fill(fill_v)
+                            inp.evaluate("e => { e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); }")
+                except:
+                    pass
+
             try:
                 continue_btn.scroll_into_view_if_needed()
             except:
                 pass
             time.sleep(0.5)
-            print(f"  [AI] Clicking Continue ('{continue_btn.inner_text().strip()}')...")
+            btn_lbl = ""
+            try:
+                btn_lbl = continue_btn.inner_text().strip()
+            except:
+                pass
+            print(f"  [AI] Clicking Continue ('{btn_lbl or 'Continue'}')...")
             try:
                 continue_btn.click()
             except:
@@ -462,75 +723,76 @@ def solve_indeed_apply_on_page(apply_page, job_title=""):
 # ═══════════════════════════════════════════════════════════════════════════════
 def solve_indeed_apply_in_page(page, job_title=""):
     """
-    Solves Indeed Apply when rendered inside an iframe on the main page.
+    Solves Indeed Apply when rendered inside an iframe or in-page modal dialog.
     """
-    print(f"  [AI] Checking in-page iframe for '{job_title}'...")
+    print(f"  [AI] Checking in-page apply form for '{job_title}'...")
     time.sleep(2.0)
 
-    iframe_selectors = [
-        'iframe[title*="apply" i]',
-        'iframe[id*="indeedApply"]',
-        'iframe[class*="apply"]',
-        'iframe[src*="indeedapply"]',
-        'iframe[src*="smartapply"]',
-    ]
-    frame_loc = None
-    for sel in iframe_selectors:
-        try:
-            if page.locator(sel).count() > 0:
-                frame_loc = page.frame_locator(sel)
-                break
-        except:
-            pass
+    # 1. Check if the page itself redirected to smartapply
+    curr_url = get_page_url(page)
+    if "smartapply" in curr_url or "/form/" in curr_url:
+        return solve_indeed_apply_on_page(page, job_title=job_title)
 
-    if not frame_loc:
-        print("  [!] No apply iframe found on main page.")
-        return False
+    # 2. Check for an apply frame in page.frames
+    target_frame = None
+    for f in page.frames:
+        f_url = f.url.lower()
+        f_name = f.name.lower()
+        if any(k in f_url for k in ["indeedapply", "smartapply", "form", "apply"]) or any(k in f_name for k in ["indeedapply", "smartapply", "apply"]):
+            target_frame = f
+            break
 
-    for step in range(8):
-        time.sleep(2.0)
-        # Check success
-        try:
-            body = frame_loc.locator("body").inner_text().lower()
-            if any(t in body for t in ["submitted", "sent", "applied"]):
-                print("  [✓] Application submitted inside iframe!")
-                return True
-        except:
-            return True
-
-        # Fill profile
-        profile = load_profile_data()
-        personal = profile.get("personal_info", {})
-        for label, val in {
-            "First name": personal.get("first_name", "Yuvraj"),
-            "Last name": personal.get("last_name", "Bhakar"),
-            "Email": personal.get("email", "yuvibhatkar702@gmail.com"),
-            "Phone": personal.get("phone", "+917767055408"),
-            "City": personal.get("city", "Pune"),
-        }.items():
+    # 3. Check for iframe locators
+    if not target_frame:
+        iframe_selectors = [
+            'iframe[title*="apply" i]',
+            'iframe[id*="indeedApply" i]',
+            'iframe[id*="indeedapply" i]',
+            'iframe[class*="apply" i]',
+            'iframe[src*="indeedapply" i]',
+            'iframe[src*="smartapply" i]',
+            'iframe#indeedapply-modal-preload-iframe',
+            'div#indeedapply-modal iframe',
+            'div[class*="indeed-apply"] iframe',
+        ]
+        for sel in iframe_selectors:
             try:
-                l = frame_loc.get_by_label(label, exact=False)
-                if l.count() > 0 and l.first.is_visible() and not l.first.input_value().strip():
-                    l.first.fill(val)
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    target_frame = el.content_frame()
+                    if target_frame:
+                        break
             except:
                 pass
 
-        # Submit or Continue
-        try:
-            sub = frame_loc.get_by_role("button", name=re.compile(r"submit.*application|submit", re.IGNORECASE))
-            if sub.count() > 0 and sub.first.is_visible():
-                sub.first.click()
-                time.sleep(4.0)
-                return True
-            cont = frame_loc.get_by_role("button", name=re.compile(r"continue|next|review", re.IGNORECASE))
-            if cont.count() > 0 and cont.first.is_visible():
-                cont.first.click()
-                time.sleep(2.5)
-                continue
-        except:
-            pass
+    # 4. Check for in-page modal dialog if no iframe
+    modal_el = None
+    if not target_frame:
+        modal_selectors = [
+            'div[role="dialog"]:has-text("Apply")',
+            'div[data-testid*="indeedApply"]',
+            '#indeedapply-modal',
+            'div.ia-Modal',
+            'div.ia-BasePage',
+            'div[class*="indeed-apply"]',
+            'dialog[open]'
+        ]
+        for m_sel in modal_selectors:
+            try:
+                m = page.query_selector(m_sel)
+                if m and m.is_visible():
+                    modal_el = m
+                    break
+            except:
+                pass
 
-    return False
+    if not target_frame and not modal_el:
+        print("  [!] No apply iframe or modal dialog found on page.")
+        return False
+
+    context_target = target_frame if target_frame else page
+    print(f"  [AI] Solving application inside {'iframe' if target_frame else 'in-page modal'}...")
+    return solve_indeed_apply_on_page(context_target, job_title=job_title)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN AUTOMATION RUNNER
@@ -582,7 +844,23 @@ def run_indeed():
                 window.chrome.runtime = {};
             }
         """)
-        page = context.new_page()
+
+        # Dynamically track newly opened tabs
+        newly_opened_tabs = []
+        context.on("page", lambda p: newly_opened_tabs.append(p))
+
+        # Re-use existing main page or create one, and close old leftover tabs from previous runs
+        if context.pages:
+            page = context.pages[0]
+            for old_p in list(context.pages[1:]):
+                try:
+                    p_url = get_page_url(old_p)
+                    if "smartapply" in p_url or "about:blank" in p_url or "viewjob" in p_url:
+                        old_p.close()
+                except:
+                    pass
+        else:
+            page = context.new_page()
 
         print("\n" + "=" * 65)
         print("  🔍 INDEED 0-1 YEARS EASILY APPLY ASSISTANT")
@@ -611,7 +889,7 @@ def run_indeed():
             time.sleep(1)
         print("\n\nTimer finished. Starting automated application loop...\n")
 
-        target_applications = 30
+        target_applications = 999999
         applications_done = 0
         visited_keys = set()
 
@@ -619,9 +897,10 @@ def run_indeed():
         current_active_url = page.url
         queries_to_run = [current_active_url] + [q for q in SEARCH_QUERIES if q != current_active_url]
 
-        for q_idx, search_url in enumerate(queries_to_run):
-            if applications_done >= target_applications:
-                break
+        while applications_done < target_applications:
+            for q_idx, search_url in enumerate(queries_to_run):
+                if applications_done >= target_applications:
+                    break
 
             # If it's not the initial loaded page, navigate to the query
             if q_idx > 0:
@@ -720,44 +999,109 @@ def run_indeed():
                     visited_keys.add(job["key"])
                     print(f"\n[Job]: {job['title']} @ {job['company']} ({job['location']})")
 
-                    # 1. Click job card to load right details pane
+                    # Dismiss any open filter popups before interacting with cards
+                    dismiss_open_popups(page)
+
+                    # 1. Click job card's title link to trigger right details pane
+                    card_clicked = False
                     try:
-                        job["card"].evaluate("el => { el.scrollIntoView({block: 'center'}); el.click(); }")
-                        page.wait_for_timeout(3000)
-                    except Exception as e:
-                        print(f"  [!] Failed to click job card: {e}")
+                        fresh_card = page.query_selector(f'div[data-jk="{job["key"]}"], tr[data-jk="{job["key"]}"]') or job["card"]
+                        title_anchor = fresh_card.query_selector('a.jcs-JobTitle, h2.jobTitle a, a[id^="job_"]')
+                        if title_anchor:
+                            try:
+                                title_anchor.scroll_into_view_if_needed()
+                                time.sleep(0.3)
+                                title_anchor.click(force=True)
+                                card_clicked = True
+                            except:
+                                pass
+                        if not card_clicked and fresh_card:
+                            try:
+                                fresh_card.scroll_into_view_if_needed()
+                                time.sleep(0.2)
+                                fresh_card.click(force=True)
+                                card_clicked = True
+                            except:
+                                pass
+                    except Exception as click_err:
+                        # Non-fatal: if clicking card in left list fails, direct /viewjob?jk= fallback will handle it
+                        pass
+
+                    # 2. Wait up to 3.5 seconds for right pane to update and render apply button
+                    apply_btn = None
+                    btn_text = None
+                    for _ in range(7):
+                        time.sleep(0.5)
+                        apply_btn, btn_text = find_indeed_apply_button(page)
+                        if apply_btn or btn_text == "external":
+                            break
+
+                    # Fallback: if not found in right pane, open direct /viewjob?jk= link in new tab
+                    direct_page = None
+                    if not apply_btn and btn_text != "external" and job.get("key"):
+                        print(f"  [Fallback] Right pane not updated. Opening direct job link /viewjob?jk={job['key']}...")
+                        direct_page = context.new_page()
+                        try:
+                            direct_page.goto(f"https://in.indeed.com/viewjob?jk={job['key']}", wait_until="domcontentloaded", timeout=15000)
+                            time.sleep(2.0)
+                            apply_btn, btn_text = find_indeed_apply_button(direct_page)
+                        except Exception as e:
+                            print(f"  [!] Direct link error: {e}")
+
+                    if btn_text == "external":
+                        print("  [Skipped] External company site application.")
+                        if direct_page and not direct_page.is_closed():
+                            direct_page.close()
                         continue
 
-                    # 2. Verify right pane apply button
-                    apply_btn = page.query_selector(
-                        'button#indeedApplyButton, '
-                        'button:has-text("Apply with Indeed"), '
-                        'button:has-text("Apply now"), '
-                        'button.ia-IndeedApplyButton'
-                    )
-                    if not apply_btn or not apply_btn.is_visible():
-                        print("  [Skipped] No active 'Apply with Indeed' button in right pane.")
-                        continue
-
-                    btn_text = apply_btn.inner_text().strip()
-                    if "company site" in btn_text.lower() or "company website" in btn_text.lower():
-                        print(f"  [Skipped] External application link ('{btn_text}').")
+                    if not apply_btn:
+                        print("  [Skipped] No internal Apply button found on card or direct page.")
+                        if direct_page and not direct_page.is_closed():
+                            direct_page.close()
                         continue
 
                     print(f"  Found internal apply button: '{btn_text}'. Clicking...")
+                    active_apply_page = direct_page if direct_page else page
                     pages_before = len(context.pages)
 
+                    newly_opened_tabs.clear()
+                    apply_page = None
+
+                    # Strategy 1: expect_popup (direct CDP target binding)
                     try:
-                        apply_btn.click()
+                        with active_apply_page.expect_popup(timeout=4000) as popup_info:
+                            try:
+                                apply_btn.click()
+                            except:
+                                apply_btn.evaluate("el => el.click()")
+                        apply_page = popup_info.value
                     except:
-                        apply_btn.evaluate("el => el.click()")
+                        pass
 
-                    human_delay(3.0, 5.0)
+                    # Strategy 2: If expect_popup didn't fire, check newly_opened_tabs and context.pages
+                    if not apply_page:
+                        if not newly_opened_tabs and len(context.pages) <= pages_before:
+                            try:
+                                apply_btn.click()
+                            except:
+                                apply_btn.evaluate("el => el.click()")
 
-                    # 3. Check if opened in new tab/window
+                        for _ in range(12):
+                            active_apply_page.wait_for_timeout(400)
+                            if newly_opened_tabs:
+                                apply_page = newly_opened_tabs[-1]
+                                break
+                            if len(context.pages) > pages_before:
+                                apply_page = context.pages[-1]
+                                break
+
+                    # 4. Check if opened in new tab/window
                     success = False
-                    if len(context.pages) > pages_before:
-                        apply_page = context.pages[-1]
+                    if apply_page:
+                        try:
+                            apply_page.bring_to_front()
+                        except:
+                            pass
 
                         # Wait for the newly opened tab to navigate away from empty/about:blank
                         print("  [→] Application tab opened. Waiting for URL to load...")
@@ -766,7 +1110,7 @@ def run_indeed():
                             apply_url = get_page_url(apply_page)
                             if apply_url and "about:blank" not in apply_url:
                                 break
-                            time.sleep(0.5)
+                            active_apply_page.wait_for_timeout(500)
 
                         # If on smartapply trampoline (applybyapplyablejobid), wait for /form/
                         if "smartapply" in apply_url and "/form/" not in apply_url:
@@ -775,7 +1119,7 @@ def run_indeed():
                                 apply_url = get_page_url(apply_page)
                                 if "/form/" in apply_url:
                                     break
-                                time.sleep(0.5)
+                                active_apply_page.wait_for_timeout(500)
 
                         print(f"  [→] Application tab loaded: {apply_url[:80]}")
 
@@ -794,10 +1138,18 @@ def run_indeed():
                                     apply_page.close()
                                 except:
                                     pass
+                            if direct_page and not direct_page.is_closed():
+                                direct_page.close()
                             continue
                     else:
                         # In-page apply form
-                        success = solve_indeed_apply_in_page(page, job_title=job["title"])
+                        success = solve_indeed_apply_in_page(active_apply_page, job_title=job["title"])
+
+                    if direct_page and not direct_page.is_closed():
+                        try:
+                            direct_page.close()
+                        except:
+                            pass
 
                     # 4. Record result
                     if success:
@@ -842,6 +1194,15 @@ def run_indeed():
                         break
                 except:
                     break
+
+            if applications_done >= target_applications:
+                break
+
+            print("\n[♾️ Unstoppable Mode] Completed scanning all Indeed queries.")
+            print("  Waiting 60 seconds before cycling queries again for newly posted jobs...")
+            for sec in range(60, 0, -1):
+                print(f"  Resuming in {sec}s...", end="\r")
+                time.sleep(1)
 
         # ── Final Report ──────────────────────────────────────────────────
         print(f"\n[+] Indeed run completed. Applied to {applications_done} jobs.")

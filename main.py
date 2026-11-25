@@ -74,14 +74,15 @@ def main_menu():
 
  [1] 🟢 Run Naukri Assistant (Instant Apply + Chatbot Solver)
  [2] 💼 Run LinkedIn Assistant (Easy Apply Solver)
- [3] 🌐 Run Hirist Assistant
+ [3] 🎯 Run Unstop Assistant (Jobs & Internships Auto-Apply)
  [4] 🔍 Run Indeed Assistant (Easily Apply Solver)
  [5] 🔄 Run All Platforms Sequentially
  [6] 📄 View Candidate Profile
  [7] 🧠 View Cached QA Memory
  [8] ❌ Exit
+ [9] ♾️ Run UNSTOPPABLE 24/7 Automation (Never Stops, Auto-Recovers, Multi-Platform Loop)
 """)
-        choice = input("Enter choice [1-8]: ").strip()
+        choice = input("Enter choice [1-9]: ").strip()
 
         if choice == "1":
             run_script("naukri_assistant.py")
@@ -90,7 +91,7 @@ def main_menu():
             run_script("linkedin_assistant.py")
             input("\nApplication run finished. Press ENTER to return to menu...")
         elif choice == "3":
-            run_script("hirist_assistant.py")
+            run_script("unstop_assistant.py")
             input("\nApplication run finished. Press ENTER to return to menu...")
         elif choice == "4":
             run_script("indeed_assistant.py")
@@ -99,6 +100,7 @@ def main_menu():
             print("\n[+] Starting Full Suite Application Run...")
             run_script("naukri_assistant.py")
             run_script("linkedin_assistant.py")
+            run_script("unstop_assistant.py")
             run_script("indeed_assistant.py")
             input("\nFull Suite finished. Press ENTER to return to menu...")
         elif choice == "6":
@@ -108,6 +110,9 @@ def main_menu():
         elif choice == "8":
             print("\nExiting. Good luck with your job search! 🚀")
             break
+        elif choice == "9":
+            run_script("unstoppable_runner.py")
+            input("\nUnstoppable run ended. Press ENTER to return to menu...")
         else:
             print("[!] Invalid choice. Try again.")
 

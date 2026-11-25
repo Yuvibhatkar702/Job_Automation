@@ -11,39 +11,89 @@ from ai_provider import ask_ai, is_ai_available
 from profile_manager import get_candidate_profile_prompt
 from qa_engine import answer_hr_question
 
+DRAWER_SELECTORS = [
+    "div.chatbot_DrawerContainer",
+    "div[class*='chatbot_Drawer' i]",
+    "div[class*='chatbot' i]",
+    "section[class*='chatbot' i]",
+    "div[class*='apply-drawer' i]",
+    "div[class*='applyDrawer' i]",
+    "div[class*='screeningQuestions' i]",
+    "div[class*='screening' i]",
+    "div[class*='apply-modal' i]",
+    "div.drawer-wrapper",
+    "div.apply-message-container",
+    "div[role='dialog']",
+    "div[class*='drawer' i]",
+]
+
+def find_active_drawer(page):
+    """Find the active Naukri chatbot/questionnaire drawer, ignoring header/nav drawers."""
+    for sel in DRAWER_SELECTORS:
+        try:
+            elements = page.query_selector_all(sel)
+            for el in elements:
+                if not el or not el.is_visible():
+                    continue
+                cls = (el.get_attribute("class") or "").lower()
+                if "gnb" in cls or "nav" in cls or "header" in cls:
+                    continue
+                box = el.bounding_box()
+                if box and box.get("width", 0) >= 240 and box.get("height", 0) >= 200:
+                    return el, sel
+        except:
+            pass
+    return None, ""
+
 def click_save_if_present(page, drawer=None):
-    """Helper to find and click the Save/Submit button in the drawer or modal."""
+    """Helper to find and click an enabled Save/Submit button strictly inside the active drawer/modal."""
+    scope = drawer
+    if not scope:
+        scope, _ = find_active_drawer(page)
+    if not scope:
+        return False
+
     save_selectors = [
         "button:has-text('Save & Apply')",
         "button:has-text('Save and Apply')",
         "button:has-text('Save & Continue')",
         "button:has-text('Save')",
         "button:has-text('Submit')",
-        "button:has-text('Apply')",
         "button[class*='save']",
         "button[class*='submit']",
         "button.btn-save",
-        "button.apply-button",
-        "div[class*='chatbot'] button:has-text('Save')",
-        "div[class*='drawer'] button:has-text('Save')",
-        ".chatbot_DrawerContainer button:has-text('Save')",
-        ".chatbot_DrawerContainer button:has-text('Apply')"
+        "div[class*='save']:not(:has(div[class*='save']))"
     ]
     for sel in save_selectors:
         try:
-            btns = page.query_selector_all(sel)
+            btns = scope.query_selector_all(sel)
             for btn in btns:
-                if btn and btn.is_visible():
-                    txt = btn.inner_text().strip()
-                    if txt.lower() in ["cancel", "close", "skip", "x"]:
-                        continue
-                    print(f"  [AI] Clicking Save/Submit button ('{txt}')...")
+                if not btn or not btn.is_visible():
+                    continue
+                txt = btn.inner_text().strip()
+                txt_lower = txt.lower()
+                if txt_lower in ["cancel", "close", "skip", "x", "saved", ""]:
+                    continue
+                # Never click a disabled Save button
+                cls = (btn.get_attribute("class") or "").lower()
+                is_dis = (
+                    btn.is_disabled()
+                    or btn.get_attribute("disabled") is not None
+                    or btn.get_attribute("aria-disabled") == "true"
+                    or "disabled" in cls
+                )
+                if is_dis:
+                    continue
+                print(f"  [AI] Clicking Save/Submit button ('{txt}')...")
+                try:
+                    btn.click(timeout=3000)
+                except:
                     try:
                         btn.evaluate("el => { el.click(); el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true})); }")
                     except:
                         btn.click(force=True)
-                    time.sleep(2.5)
-                    return True
+                time.sleep(2.5)
+                return True
         except:
             pass
     return False
@@ -52,14 +102,14 @@ def solve_naukri_chatbot(page, profile):
     """
     Robust Naukri Chatbot & Questionnaire Solver.
     Accurately solves:
-    1. Multi-turn Chatbot drawer (Wait for next question, never click Save prematurely).
-    2. Multi-question Form / Questionnaire drawers (Groups radios, fills all inputs/dropdowns before Save).
-    3. Screening questions (Always Yes for shifts/relocation/skills to prevent rejection).
+    1. Multi-turn Chatbot drawer & Naukri Campus Questionnaire (loops through all questions until drawer closes).
+    2. Scopes all DOM queries strictly inside the active chatbot drawer so job page elements behind it are never touched.
+    3. Triggers native Playwright clicks on React radio/chip options so the Save button activates properly.
+    4. Enforces mandatory question completion before clicking Save to avoid 'Incomplete information' rejection.
     """
     print("  [AI] Initiating Naukri Chatbot / Questionnaire Solver...")
     if not is_ai_available():
-        print("  [!] No AI API key available. Cannot converse with bot.")
-        return False
+        print("  [AI] Note: External AI key not active. Proceeding with QA Engine memory and deterministic heuristics.")
 
     # ── Phase 0: Quick page state check ────────────────────────────────────
     time.sleep(2.5)
@@ -69,48 +119,32 @@ def solve_naukri_chatbot(page, profile):
     except:
         pass
 
-    if "oops" in page_text and "incomplete" in page_text:
+    if "saveapply" in page.url.lower() or ("oops" in page_text and "incomplete" in page_text):
         print("  [!] Naukri error: application rejected due to incomplete information.")
         return False
     if "successfully applied" in page_text or "applied successfully" in page_text or "application submitted" in page_text:
         print("  [✓] Already applied successfully (instant apply).")
         return True
 
-    # ── Phase 1: Detect chatbot drawer / modal container ──────────────────
-    drawer_selectors = [
-        "div.chatbot_DrawerContainer", "div[class*='chatbot']", "div[class*='ChatBot']",
-        "div[class*='drawer']", "div[class*='Drawer']", "div[class*='apply-drawer']",
-        "div[class*='applyDrawer']", "section[class*='chatbot']", "div[class*='chat-container']",
-        "div[class*='screeningQuestions']", "div[class*='screening']", "div[class*='apply-modal']",
-        "div.drawer-wrapper", "div.apply-message-container"
-    ]
+    # ── Phase 1: Wait for chatbot drawer / modal container ────────────────
     drawer = None
-    for _ in range(3):
-        for sel in drawer_selectors:
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    drawer = el
-                    print(f"  [AI] Found application container: {sel}")
-                    break
-            except:
-                pass
+    drawer_sel = ""
+    for _ in range(4):
+        drawer, drawer_sel = find_active_drawer(page)
         if drawer:
+            print(f"  [AI] Found application container: {drawer_sel}")
             break
-        time.sleep(1.0)
+        time.sleep(0.8)
 
     if not drawer:
         form_inputs = page.query_selector_all(
-            "input:not([type='hidden']):not([type='file']):not([placeholder*='Search']), select, textarea"
+            "input:not([type='hidden']):not([type='file']):not([placeholder*='Search' i]), select, textarea"
         )
         visible_inputs = [inp for inp in form_inputs if inp.is_visible()]
         if visible_inputs:
-            print("  [AI] No drawer container detected. Found standard form inputs. Handing to form filler...")
+            print("  [AI] No drawer detected. Found form inputs. Handing to form filler...")
             return solve_complex_form_with_ai(page, profile)
-        
-        if click_save_if_present(page):
-            return True
-        print("  [!] No chatbot, no form, no save button found.")
+        print("  [!] No chatbot drawer or form appeared after clicking Apply.")
         return False
 
     # ── Phase 2: Conversational / Form solving loop ───────────────────────
@@ -119,12 +153,13 @@ def solve_naukri_chatbot(page, profile):
     MAX_TURNS = 20
 
     for turn in range(MAX_TURNS):
-        time.sleep(2.0)
+        time.sleep(1.5)
 
         # Step 1: Check terminal states (Success / Error / Drawer closed)
         try:
+            curr_url = page.url.lower()
             body_lower = page.inner_text("body").lower()
-            if "oops" in body_lower and "incomplete" in body_lower:
+            if "saveapply" in curr_url or ("oops" in body_lower and "incomplete" in body_lower):
                 print("  [!] Naukri error page: Application incomplete.")
                 return False
 
@@ -136,110 +171,184 @@ def solve_naukri_chatbot(page, profile):
                 print("  [✓] Confirmed application success banner!")
                 return True
 
-            # Check if drawer has disappeared (application submitted)
-            drawer_visible = False
-            for sel in drawer_selectors:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    drawer_visible = True
-                    break
-            if not drawer_visible:
+            drawer, drawer_sel = find_active_drawer(page)
+            if not drawer and turn > 0:
                 print("  [✓] Chatbot / questionnaire drawer closed. Application submitted successfully.")
                 return True
-
-            # Check if bot has closing message
-            drawer_text = drawer.inner_text().lower() if drawer else ""
-            if any(s in drawer_text for s in [
-                "thank you for showing interest", "response has been recorded",
-                "thank you for applying", "we have received your application",
-                "your application is submitted"
-            ]):
-                print("  [✓] Recruiter chatbot indicated completion. Finalizing...")
-                click_save_if_present(page)
-                time.sleep(2.0)
-                return True
+            if not drawer:
+                print("  [!] Drawer closed unexpectedly on turn 0.")
+                return False
         except:
             pass
 
-        # Step 2: Extract latest bot question
+        # Step 2: Extract latest bot question strictly inside `drawer`
         question_text = ""
-        msg_selectors = [
-            ".botMsg", ".bot-msg", ".chatbot-msg",
-            "div[class*='bot-message']", "div[class*='botMsg']",
-            "div[class*='msg-bot']", "div[class*='chatbot'] div[class*='msg']",
-            "div[class*='bubble']", "div[class*='chat-msg']",
-            "div[class*='drawer'] div[class*='msg']",
-            "div[class*='question']", "label[class*='question']",
-            "div[class*='msgText']"
-        ]
-        bot_messages = []
-        for sel in msg_selectors:
-            try:
-                elements = page.query_selector_all(sel)
-                for el in elements:
-                    if el.is_visible():
-                        txt = el.inner_text().strip()
-                        if txt and len(txt) > 3:
-                            bot_messages.append(txt)
-            except:
-                pass
+        try:
+            bot_messages = drawer.evaluate("""(root) => {
+                const skipPhrases = [
+                    "thank you for showing", "kindly answer all", "type message",
+                    "save", "submit", "cancel", "close"
+                ];
+                // Prefer explicit chat message / question nodes
+                const specific = root.querySelectorAll(
+                    ".botMsg, .bot-msg, .chatbot-msg, div[class*='bot-message' i], " +
+                    "div[class*='botMsg' i], div[class*='msg-bot' i], div[class*='msgText' i], " +
+                    "div[class*='question' i], label[class*='question' i], p[class*='question' i], " +
+                    "div[class*='bubble' i], div[class*='chat-msg' i], li[class*='bot' i]"
+                );
+                const msgs = [];
+                const addIfValid = (el) => {
+                    if (!el || el.offsetParent === null) return;
+                    // Skip nodes that contain radio inputs or option lists
+                    if (el.querySelector("input[type='radio'], input[type='checkbox'], select")) return;
+                    const t = (el.innerText || "").trim();
+                    if (!t || t.length < 4) return;
+                    const tl = t.toLowerCase();
+                    if (skipPhrases.some(sp => tl.includes(sp)) || tl === "skip this question" || tl === "skip") return;
+                    msgs.push(t);
+                };
+                specific.forEach(addIfValid);
+                if (msgs.length === 0) {
+                    // Fallback: scan leaf text blocks inside drawer (excluding buttons/labels/inputs)
+                    root.querySelectorAll("p, span, div, h2, h3, h4").forEach(el => {
+                        if (el.closest("button, label, ul, ol, [role='radiogroup']")) return;
+                        if (el.children.length > 0 && el.querySelector("p, div, input, button, label")) return;
+                        addIfValid(el);
+                    });
+                }
+                // Deduplicate preserving order
+                const unique = [];
+                const seen = new Set();
+                for (const m of msgs) {
+                    const norm = m.toLowerCase();
+                    if (!seen.has(norm)) {
+                        seen.add(norm);
+                        unique.push(m);
+                    }
+                }
+                return unique;
+            }""")
+            if bot_messages:
+                question_text = bot_messages[-1]
+        except Exception:
+            pass
 
-        unique_msgs = []
-        seen = set()
-        for m in bot_messages:
-            norm = m.strip().lower()
-            if norm not in seen and "type message" not in norm:
-                seen.add(norm)
-                unique_msgs.append(m)
-        if unique_msgs:
-            question_text = unique_msgs[-1]
-
-        # Step 3: Handle RADIO BUTTON GROUPS (Crucial: grouped by question)
+        # Step 3: Handle RADIO BUTTONS & OPTION CONTAINERS strictly inside `drawer`
         radio_groups_answered = 0
         try:
-            radio_data = page.evaluate("""() => {
-                const radios = Array.from(document.querySelectorAll("input[type='radio']")).filter(r => {
-                    const rect = r.getBoundingClientRect();
-                    return rect.width > 0 || r.offsetParent !== null || (r.parentElement && r.parentElement.offsetParent !== null);
-                });
-                const byGroup = {};
+            # Explicit check for "Graduate" vs "Student (We do NOT hire students)"
+            grad_opt = drawer.query_selector("label:has-text('Graduate'), div:has-text('Graduate'), span:has-text('Graduate')")
+            student_opt = drawer.query_selector("*:has-text('We do NOT hire students')")
+            if grad_opt and student_opt and grad_opt.is_visible():
+                is_selected = grad_opt.evaluate("""el => {
+                    const r = el.querySelector("input[type='radio']") || (el.tagName === 'LABEL' ? document.querySelector("input#" + el.getAttribute("for")) : null);
+                    if (r && r.checked) return true;
+                    return el.classList.contains("selected") || el.classList.contains("active") || el.getAttribute("aria-checked") === "true";
+                }""")
+                if not is_selected:
+                    print("  [AI Radio]: Detected 'Graduate' vs 'Student (We do NOT hire students)'. Selecting 'Graduate'...")
+                    try:
+                        grad_opt.click()
+                    except:
+                        grad_opt.click(force=True)
+                    radio_groups_answered += 1
+                    time.sleep(0.5)
+
+            radio_data = drawer.evaluate("""(root) => {
+                const results = [];
+                const skipPhrases = ["thank you for showing", "kindly answer all"];
+                const isGreeting = (t) => !t || skipPhrases.some(sp => t.toLowerCase().includes(sp));
+
+                // 1. Standard radio inputs inside drawer
+                const radios = Array.from(root.querySelectorAll("input[type='radio']"));
+                const byName = {};
                 radios.forEach((r, idx) => {
-                    const grpName = r.name || ('group_' + (r.closest('fieldset, .radio-group, div[class*="question"]') || r.parentElement).id || 'grp_0');
-                    if (!byGroup[grpName]) byGroup[grpName] = [];
-                    byGroup[grpName].push(r);
+                    const name = r.name || ('grp_' + idx);
+                    if (!byName[name]) byName[name] = [];
+                    byName[name].push(r);
                 });
 
-                const result = [];
-                for (const [name, rList] of Object.entries(byGroup)) {
+                for (const [name, rList] of Object.entries(byName)) {
                     const isChecked = rList.some(r => r.checked);
                     let qText = '';
-                    const parent = rList[0].closest('fieldset, .radio-group, div[class*="question"], div[class*="row"], .chatbot_DrawerContainer');
-                    if (parent) {
-                        const legend = parent.querySelector('legend, label[class*="question"], div[class*="question"], p');
-                        if (legend) qText = legend.innerText.trim();
-                    }
-                    if (!qText && rList[0].closest('div')) {
-                        const prev = rList[0].closest('div').previousElementSibling;
-                        if (prev) qText = prev.innerText.trim();
+                    // Look upward from first radio's group container for the closest question text
+                    const grpCont = rList[0].closest('fieldset, .radio-group, div[class*="question" i], div[class*="option" i], ul, div');
+                    if (grpCont) {
+                        const legend = grpCont.querySelector('legend, label[class*="question" i], div[class*="question" i], p');
+                        if (legend && !legend.querySelector("input") && !isGreeting(legend.innerText.trim())) {
+                            qText = legend.innerText.trim();
+                        }
+                        if (!qText && grpCont.previousElementSibling) {
+                            const pt = grpCont.previousElementSibling.innerText.trim();
+                            if (!isGreeting(pt)) qText = pt;
+                        }
                     }
                     const options = rList.map((r, i) => {
-                        const lbl = r.closest('label') || document.querySelector('label[for="' + r.id + '"]') || r.parentElement;
+                        const lbl = (r.id ? root.querySelector('label[for="' + CSS.escape(r.id) + '"]') : null) || r.closest('label') || r.parentElement;
                         return {
+                            type: 'standard',
                             id: r.id || '',
+                            name: name,
                             index: i,
                             checked: r.checked,
                             label: lbl ? lbl.innerText.trim() : ('Option ' + (i + 1))
                         };
                     });
-                    result.push({
+                    results.push({
+                        type: 'standard',
                         name: name,
                         isChecked: isChecked,
                         question: qText,
                         options: options
                     });
                 }
-                return result;
-            }""")
+
+                // 2. Custom radio / option containers inside drawer (only if no standard radios matched)
+                if (results.length === 0) {
+                    const optionContainers = root.querySelectorAll(
+                        "div[class*='bot-options' i], div[class*='options-container' i], div[class*='radioGroup' i], " +
+                        "div[class*='custom-radio' i], div[role='radiogroup'], ul[class*='options' i]"
+                    );
+                    optionContainers.forEach((cont, contIdx) => {
+                        const items = Array.from(cont.querySelectorAll(
+                            "div[class*='option' i], div[class*='radio' i], label, li, div[role='radio']"
+                        )).filter(el => {
+                            const t = el.innerText.trim();
+                            return t.length > 0 && !el.querySelector("div[class*='option' i]");
+                        });
+
+                        if (items.length >= 2) {
+                            const isChecked = items.some(it =>
+                                it.classList.contains('selected') ||
+                                it.classList.contains('active') ||
+                                it.classList.contains('checked') ||
+                                it.getAttribute('aria-checked') === 'true'
+                            );
+                            let qText = '';
+                            const prev = cont.previousElementSibling;
+                            if (prev && !isGreeting(prev.innerText.trim())) qText = prev.innerText.trim();
+
+                            const options = items.map((it, i) => ({
+                                type: 'custom',
+                                contIndex: contIdx,
+                                index: i,
+                                checked: it.classList.contains('selected') || it.classList.contains('active'),
+                                label: it.innerText.trim()
+                            }));
+
+                            results.push({
+                                type: 'custom',
+                                contIndex: contIdx,
+                                isChecked: isChecked,
+                                question: qText,
+                                options: options
+                            });
+                        }
+                    });
+                }
+
+                return results;
+            }""", drawer)
 
             for grp in radio_data:
                 if not grp["isChecked"] and grp["options"]:
@@ -255,43 +364,157 @@ def solve_naukri_chatbot(page, profile):
 
                     target_opt = grp["options"][ans_idx]
                     print(f"  [AI Radio]: {q[:60]} → '{target_opt['label']}'")
-                    page.evaluate("""(data) => {
-                        let radio = null;
-                        if (data.id) radio = document.getElementById(data.id);
-                        if (!radio) {
-                            const radios = Array.from(document.querySelectorAll("input[type='radio']")).filter(r => r.name === data.name);
-                            radio = radios[data.index];
-                        }
-                        if (radio) {
-                            const lbl = radio.closest('label') || document.querySelector('label[for="' + radio.id + '"]');
-                            if (lbl) lbl.click();
-                            else radio.click();
-                            radio.checked = true;
-                            radio.dispatchEvent(new Event('change', {bubbles: true}));
-                            radio.dispatchEvent(new Event('input', {bubbles: true}));
-                            radio.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                        }
-                    }""", {"id": target_opt["id"], "name": grp["name"], "index": ans_idx})
+
+                    clicked = False
+                    if grp["type"] == "standard":
+                        # Use Playwright native click on the visible label or option row so React registers it
+                        opt_id = target_opt.get("id")
+                        if opt_id:
+                            try:
+                                lbl_el = drawer.query_selector(f"label[for='{opt_id}']")
+                                if lbl_el and lbl_el.is_visible():
+                                    lbl_el.click()
+                                    clicked = True
+                            except:
+                                pass
+                        if not clicked:
+                            try:
+                                radios = drawer.query_selector_all("input[type='radio']")
+                                matching = [r for r in radios if (r.get_attribute("name") or "") == grp.get("name")] or radios
+                                if ans_idx < len(matching):
+                                    r_el = matching[ans_idx]
+                                    row_el = r_el.evaluate_handle("r => r.closest('label') || r.parentElement")
+                                    if row_el:
+                                        row_el.as_element().click(force=True)
+                                        clicked = True
+                            except:
+                                pass
+                        if not clicked:
+                            drawer.evaluate("""(root, data) => {
+                                let radio = data.id ? root.querySelector('#' + CSS.escape(data.id)) : null;
+                                if (!radio) {
+                                    const radios = Array.from(root.querySelectorAll("input[type='radio']")).filter(r => (r.name || '') === data.name);
+                                    radio = radios[data.index];
+                                }
+                                if (radio) {
+                                    const lbl = (radio.id ? root.querySelector('label[for="' + CSS.escape(radio.id) + '"]') : null) || radio.closest('label') || radio.parentElement;
+                                    if (lbl) lbl.click();
+                                    else radio.click();
+                                }
+                            }""", {"id": opt_id, "name": grp.get("name"), "index": ans_idx})
+                    else:
+                        drawer.evaluate("""(root, data) => {
+                            const optionContainers = root.querySelectorAll(
+                                "div[class*='bot-options' i], div[class*='options-container' i], div[class*='radioGroup' i], " +
+                                "div[class*='custom-radio' i], div[role='radiogroup'], ul[class*='options' i]"
+                            );
+                            const cont = optionContainers[data.contIndex];
+                            if (cont) {
+                                const items = Array.from(cont.querySelectorAll(
+                                    "div[class*='option' i], div[class*='radio' i], label, li, div[role='radio']"
+                                )).filter(el => el.innerText.trim().length > 0 && !el.querySelector("div[class*='option' i]"));
+                                const target = items[data.index];
+                                if (target) target.click();
+                            }
+                        }""", {"contIndex": grp.get("contIndex"), "index": ans_idx})
+
                     radio_groups_answered += 1
-                    time.sleep(0.5)
+                    time.sleep(0.6)
         except Exception as e:
             pass
 
-        # Step 4: Handle CHOICE CHIPS (Chatbot Quick Replies)
-        # Note: In chatbot mode, clicking a chip sends the response and advances the chat. DO NOT click Save!
-        visible_chips = []
+        # Step 4: Handle CHAT TEXT INPUT strictly inside `drawer`
+        chat_input = None
         for sel in [
-            ".chip", "button[class*='chip']", "div[class*='chip']",
-            "button[class*='choice']", "li.list-item", "button.list-item",
-            "div[class*='quick-reply']", "div[class*='bot-options'] button",
-            "button[class*='option']"
+            "input[placeholder*='Type message' i]", "input[placeholder*='type message' i]",
+            "input[placeholder*='message here' i]", "input[placeholder*='example' i]",
+            "textarea[placeholder*='Type message' i]", "textarea[placeholder*='type message' i]",
+            "input[class*='chat-input' i]", "textarea[class*='chat' i]",
+            "input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='file']):not([type='submit']):not([type='button'])",
+            "textarea",
+            "[contenteditable='true']"
         ]:
             try:
-                chips = page.query_selector_all(sel)
+                el = drawer.query_selector(sel)
+                if el and el.is_visible() and not el.is_disabled():
+                    chat_input = el
+                    break
+            except:
+                pass
+
+        if chat_input and radio_groups_answered == 0:
+            try:
+                curr_val = chat_input.evaluate("e => (e.value !== undefined ? e.value : e.innerText || '').trim()")
+            except:
+                curr_val = ""
+            if not curr_val:
+                q_for_input = question_text or "Answer recruiter question"
+                answer = answer_hr_question(q_for_input)
+                if not answer:
+                    answer = "I have 1 year of hands-on experience in full-stack development with React, Node.js, and Python."
+                if len(answer) > 250:
+                    answer = answer[:250]
+
+                print(f"  [AI Chat Reply]: '{answer[:60]}' for '{q_for_input[:60]}'")
+                try:
+                    is_ce = chat_input.evaluate("e => e.isContentEditable === true")
+                    chat_input.click()
+                    if is_ce:
+                        page.keyboard.press("Control+A")
+                        page.keyboard.press("Backspace")
+                        page.keyboard.type(answer, delay=20)
+                    else:
+                        chat_input.fill("")
+                        time.sleep(0.2)
+                        chat_input.fill(answer)
+                    chat_input.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }")
+                    time.sleep(0.5)
+
+                    # 1. Try sending via Enter
+                    chat_input.press("Enter")
+                    time.sleep(1.0)
+
+                    # 2. Look for explicit Send button inside drawer
+                    send_btn = drawer.query_selector("button[class*='send' i], span[class*='send' i], div[class*='send' i], button[type='submit']")
+                    if send_btn and send_btn.is_visible() and not send_btn.is_disabled():
+                        send_btn.click()
+                        time.sleep(1.5)
+
+                    # 3. In Naukri Campus drawer, the bottom Save button submits the current step
+                    click_save_if_present(page, drawer)
+
+                    # Check post-submit state
+                    final_body = page.inner_text("body").lower() if page else ""
+                    if "saveapply" in page.url.lower() or ("oops" in final_body and "incomplete" in final_body):
+                        print("  [!] Application rejected due to incomplete information.")
+                        return False
+
+                    new_drawer, _ = find_active_drawer(page)
+                    if not new_drawer or any(s in final_body for s in ["successfully applied", "applied successfully", "application submitted"]):
+                        print("  [✓] Application completed successfully!")
+                        return True
+
+                    print("  [AI] Answer submitted. Waiting for chatbot's next question...")
+                    time.sleep(1.5)
+                    continue
+                except Exception as e:
+                    print(f"  [!] Chat input error: {e}")
+
+        # Step 5: Handle CHOICE CHIPS strictly inside `drawer` (never click 'Skip this question' when answering)
+        visible_chips = []
+        for sel in [
+            ".chip", "button[class*='chip' i]", "div[class*='chip' i]",
+            "button[class*='choice' i]", "li.list-item", "button.list-item",
+            "div[class*='quick-reply' i]", "div[class*='bot-options' i] button",
+            "button[class*='option' i]"
+        ]:
+            try:
+                chips = drawer.query_selector_all(sel)
                 for c in chips:
                     if c.is_visible():
                         ct = c.inner_text().strip()
-                        if ct and ct.lower() not in ["save", "submit", "apply", "send", "close", "cancel", "x"]:
+                        ctl = ct.lower()
+                        if ct and ctl not in ["save", "saved", "submit", "apply", "send", "close", "cancel", "x"] and not ctl.startswith("skip"):
                             visible_chips.append(c)
             except:
                 pass
@@ -307,224 +530,165 @@ def solve_naukri_chatbot(page, profile):
                 idx = 0
 
             chosen_chip = visible_chips[idx]
+            chip_state = f"chip:{question_text}:{options_list[idx]}"
+            if chip_state == last_answered_state:
+                stuck_rounds += 1
+                if stuck_rounds >= 3:
+                    print("  [!] Chip click did not advance chatbot. Aborting.")
+                    return False
+            else:
+                stuck_rounds = 0
+            last_answered_state = chip_state
+
             print(f"  [AI Reply]: Clicking chip '{options_list[idx]}' for '{question_text[:60]}'")
             try:
-                chosen_chip.evaluate("""el => {
-                    el.click();
-                    el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                }""")
-                time.sleep(2.5)  # Wait for chatbot to respond with next question
-            except Exception as e:
-                print(f"  [!] Chip click error: {e}")
+                chosen_chip.click()
+                time.sleep(2.0)
+            except Exception:
+                try:
+                    chosen_chip.click(force=True)
+                    time.sleep(2.0)
+                except:
+                    pass
             continue
 
-        # Step 5: Handle CHAT TEXT INPUT
-        chat_input = None
-        for sel in [
-            "input[placeholder*='Type message']", "input[placeholder*='type message']",
-            "input[placeholder*='message here']", "textarea[placeholder*='Type message']",
-            "textarea[placeholder*='type message']", "input[class*='chat-input']",
-            "textarea[class*='chat']", "div[class*='chatbot'] input[type='text']",
-            "div[class*='drawer'] input[type='text']", "div[class*='chatbot'] textarea",
-            "div[class*='drawer'] textarea"
-        ]:
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible() and not el.is_disabled():
-                    chat_input = el
-                    break
-            except:
-                pass
-
-        if chat_input and radio_groups_answered == 0:
-            answer = answer_hr_question(question_text or "Answer recruiter question")
-            if len(answer) > 250:
-                answer = answer[:250]
-            if not answer:
-                answer = "I am a 2026 B.Tech IT graduate with full stack development skills in React, Node, and Java. Immediate joiner."
-
-            print(f"  [AI Chat Reply]: '{answer[:60]}' for '{question_text[:60]}'")
-            try:
-                chat_input.fill("")
-                time.sleep(0.3)
-                chat_input.fill(answer)
-                time.sleep(0.5)
-
-                # Look for Send button or press Enter
-                send_btn = page.query_selector("button[class*='send'], span[class*='send'], button[type='submit'], div[class*='send']")
-                if send_btn and send_btn.is_visible():
-                    send_btn.click()
-                else:
-                    chat_input.press("Enter")
-                time.sleep(2.5)  # Wait for chatbot to respond with next question
-            except Exception as e:
-                print(f"  [!] Chat input error: {e}")
-            continue
-
-        # Step 6: Handle STANDARD FORM INPUTS (Text, number, textareas)
+        # Step 6: Handle STANDARD FORM INPUTS inside `drawer`
         form_inputs_answered = 0
         try:
-            inputs_data = page.evaluate("""() => {
-                const inputs = Array.from(document.querySelectorAll("input[type='text'], input[type='number'], input:not([type]), textarea")).filter(el => {
-                    const rect = el.getBoundingClientRect();
-                    return (rect.width > 0 || el.offsetParent !== null) && !el.disabled && !el.readOnly;
-                });
-                return inputs.map((el, i) => {
-                    const ph = el.placeholder || '';
-                    if (ph.toLowerCase().includes('type message') || ph.toLowerCase().includes('search')) return null;
-                    let lbl = '';
-                    if (el.id) {
-                        const l = document.querySelector('label[for="' + el.id + '"]');
-                        if (l) lbl = l.innerText.trim();
-                    }
-                    if (!lbl && el.closest('label')) lbl = el.closest('label').innerText.trim();
-                    if (!lbl && el.getAttribute('aria-label')) lbl = el.getAttribute('aria-label').trim();
-                    if (!lbl) lbl = ph;
-                    return {
-                        id: el.id || '',
-                        index: i,
-                        value: el.value || '',
-                        label: lbl,
-                        type: el.type || 'text'
-                    };
-                }).filter(Boolean);
-            }""")
-
-            for inp in inputs_data:
-                if not inp["value"].strip():
-                    lbl = inp["label"] or question_text or "Input"
-                    val = answer_hr_question(lbl)
+            inputs = drawer.query_selector_all("input[type='text'], input[type='number'], textarea")
+            for inp in inputs:
+                if inp.is_visible() and not inp.is_disabled():
+                    ph = (inp.get_attribute("placeholder") or "").lower()
+                    if "search" in ph or "type message" in ph:
+                        continue
+                    val = inp.input_value().strip()
                     if not val:
-                        val = "0"
-                    print(f"  [AI Form Fill]: {lbl[:40]} → {val}")
-                    page.evaluate("""(data) => {
-                        let el = null;
-                        if (data.id) el = document.getElementById(data.id);
-                        if (!el) {
-                            const inputs = Array.from(document.querySelectorAll("input[type='text'], input[type='number'], input:not([type]), textarea")).filter(e => {
-                                const r = e.getBoundingClientRect();
-                                return (r.width > 0 || e.offsetParent !== null) && !e.disabled && !e.readOnly;
-                            });
-                            el = inputs[data.index];
-                        }
-                        if (el) {
-                            el.value = data.value;
-                            el.dispatchEvent(new Event('input', {bubbles: true}));
-                            el.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
-                    }""", {"id": inp["id"], "index": inp["index"], "value": val})
-                    form_inputs_answered += 1
-                    time.sleep(0.3)
-        except:
-            pass
-
-        # Step 7: Handle DROPDOWNS (<select>)
-        selects_answered = 0
-        try:
-            selects_data = page.evaluate("""() => {
-                const selects = Array.from(document.querySelectorAll("select")).filter(s => {
-                    const r = s.getBoundingClientRect();
-                    return (r.width > 0 || s.offsetParent !== null) && !s.disabled;
-                });
-                return selects.map((s, i) => {
-                    let lbl = '';
-                    if (s.id) {
-                        const l = document.querySelector('label[for="' + s.id + '"]');
-                        if (l) lbl = l.innerText.trim();
-                    }
-                    if (!lbl && s.closest('label')) lbl = s.closest('label').innerText.trim();
-                    const opts = Array.from(s.options).map(o => ({ text: o.text.trim(), value: o.value }))
-                        .filter(o => o.text && !['select', 'select an option', '--', 'choose', ''].includes(o.text.toLowerCase()));
-                    const cur = s.options[s.selectedIndex] ? s.options[s.selectedIndex].text.trim() : '';
-                    return {
-                        id: s.id || '',
-                        index: i,
-                        label: lbl,
-                        current: cur,
-                        options: opts
-                    };
-                });
-            }""")
-
-            for s in selects_data:
-                if not s["current"] or s["current"].lower() in ["select", "select an option", "--", "choose", ""]:
-                    if s["options"]:
-                        opt_texts = [o["text"] for o in s["options"]]
-                        ans_idx_str = answer_hr_question(s["label"] or "Select", options=opt_texts)
-                        try:
-                            ans_idx = int(ans_idx_str)
-                            if not (0 <= ans_idx < len(opt_texts)):
-                                ans_idx = 0
-                        except:
-                            ans_idx = 0
-                        chosen = s["options"][ans_idx]
-                        print(f"  [AI Select]: {s['label'][:40]} → {chosen['text']}")
-                        page.evaluate("""(data) => {
-                            let el = null;
-                            if (data.id) el = document.getElementById(data.id);
-                            if (!el) {
-                                const list = Array.from(document.querySelectorAll("select"));
-                                el = list[data.index];
-                            }
-                            if (el) {
-                                el.value = data.value;
-                                el.dispatchEvent(new Event('change', {bubbles: true}));
-                            }
-                        }""", {"id": s["id"], "index": s["index"], "value": chosen["value"]})
-                        selects_answered += 1
+                        lbl = inp.get_attribute("aria-label") or ph or question_text or "Answer"
+                        ans = answer_hr_question(lbl) or "0"
+                        inp.fill(ans[:200])
+                        inp.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }")
+                        print(f"  [AI Form Fill]: {lbl[:40]} → {ans}")
+                        form_inputs_answered += 1
                         time.sleep(0.3)
         except:
             pass
 
-        # Step 8: Handle Consent / Terms CHECKBOXES
+        # Step 7: Handle DROPDOWNS (<select>) inside `drawer`
+        selects_answered = 0
         try:
-            page.evaluate("""() => {
-                document.querySelectorAll("input[type='checkbox']").forEach(cb => {
-                    const rect = cb.getBoundingClientRect();
-                    if ((rect.width > 0 || cb.offsetParent !== null) && !cb.disabled && !cb.checked) {
-                        const lbl = cb.closest('label') || document.querySelector('label[for="' + cb.id + '"]') || cb.parentElement;
-                        const txt = lbl ? lbl.innerText.toLowerCase() : '';
-                        if (txt.includes('agree') || txt.includes('terms') || txt.includes('consent') || txt.includes('confirm') || txt.includes('certify')) {
-                            cb.click();
-                            cb.checked = true;
-                            cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
-                    }
-                });
-            }""")
+            selects = drawer.query_selector_all("select")
+            for s in selects:
+                if s.is_visible() and not s.is_disabled():
+                    cur = s.evaluate("el => el.options[el.selectedIndex]?.text || ''").strip()
+                    if not cur or cur.lower() in ["select", "choose", "--", "select an option", ""]:
+                        opts = s.evaluate("""el => Array.from(el.options)
+                            .map(o => ({text: o.text.trim(), value: o.value}))
+                            .filter(o => o.text && !['select','choose','--',''].includes(o.text.toLowerCase()))""")
+                        if opts:
+                            ans_idx_str = answer_hr_question(question_text or "Select option", options=[o["text"] for o in opts])
+                            try:
+                                ans_idx = int(ans_idx_str)
+                                if not (0 <= ans_idx < len(opts)):
+                                    ans_idx = 0
+                            except:
+                                ans_idx = 0
+                            chosen = opts[ans_idx]
+                            s.select_option(value=chosen["value"]) if chosen["value"] else s.select_option(label=chosen["text"])
+                            print(f"  [AI Select]: → {chosen['text']}")
+                            selects_answered += 1
+                            time.sleep(0.3)
         except:
             pass
 
-        # Step 9: Decide when to click SAVE / SUBMIT
+        # Step 8: Check if all visible fields in drawer are filled before clicking SAVE
+        unanswered_fields = False
+        try:
+            unanswered_fields = drawer.evaluate("""(root) => {
+                const radios = Array.from(root.querySelectorAll("input[type='radio']"));
+                if (radios.length > 0) {
+                    const byName = {};
+                    radios.forEach((r, i) => {
+                        const name = r.name || ('unnamed_' + i);
+                        if (!byName[name]) byName[name] = [];
+                        byName[name].push(r);
+                    });
+                    for (const rList of Object.values(byName)) {
+                        if (!rList.some(r => r.checked)) return true;
+                    }
+                }
+                const inputs = Array.from(root.querySelectorAll("input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='file']):not([type='submit']):not([type='button']), textarea")).filter(e => {
+                    const r = e.getBoundingClientRect();
+                    return (r.width > 0 || e.offsetParent !== null) && !e.disabled && !e.readOnly;
+                });
+                for (const inp of inputs) {
+                    if (!inp.value.trim()) return true;
+                }
+                return false;
+            }""", drawer)
+        except:
+            pass
+
+        if unanswered_fields:
+            print("  [!] Unanswered questions or empty inputs detected inside drawer. Re-evaluating...")
+            stuck_rounds += 1
+            if stuck_rounds >= 3:
+                print("  [!] Stuck on unanswered mandatory fields. Aborting.")
+                return False
+            continue
+
+        answered_anything = (radio_groups_answered > 0 or form_inputs_answered > 0 or selects_answered > 0)
         current_state = f"q:{question_text}_r:{radio_groups_answered}_i:{form_inputs_answered}_s:{selects_answered}"
-        if current_state == last_answered_state:
+        if current_state == last_answered_state and not answered_anything:
             stuck_rounds += 1
         else:
             stuck_rounds = 0
         last_answered_state = current_state
 
-        if (radio_groups_answered > 0 or form_inputs_answered > 0 or selects_answered > 0) or stuck_rounds >= 1:
-            print("  [AI] Questionnaire completed on this step. Submitting...")
-            if click_save_if_present(page):
-                time.sleep(3.0)
-                # Verify if application finished
+        if answered_anything:
+            print("  [AI] Step answered. Clicking Save to advance/submit...")
+            if click_save_if_present(page, drawer):
+                time.sleep(2.5)
                 try:
+                    final_url = page.url.lower()
                     final_body = page.inner_text("body").lower()
-                    if "oops" in final_body and "incomplete" in final_body:
-                        print("  [!] Naukri returned incomplete information error.")
+                    if "saveapply" in final_url or ("oops" in final_body and "incomplete" in final_body):
+                        print("  [!] Naukri returned incomplete information error page.")
+                        return False
+                    if any(s in final_body for s in [
+                        "successfully applied", "applied successfully", "application has been sent",
+                        "already applied", "thank you for applying", "your application is submitted",
+                        "application submitted successfully"
+                    ]):
+                        print("  [✓] Confirmed application success banner!")
+                        return True
+                except:
+                    pass
+
+                # Check if drawer closed or moved to the NEXT question
+                new_drawer, _ = find_active_drawer(page)
+                if not new_drawer:
+                    print("  [✓] Drawer closed after Save. Application submitted!")
+                    return True
+                print("  [AI] Chatbot still active with next question. Continuing loop...")
+                continue
+        elif stuck_rounds >= 3:
+            # No active inputs/radios found for 3 turns — try enabled Save if present, else abort
+            if click_save_if_present(page, drawer):
+                time.sleep(2.5)
+                try:
+                    final_url = page.url.lower()
+                    final_body = page.inner_text("body").lower()
+                    if "saveapply" in final_url or ("oops" in final_body and "incomplete" in final_body):
+                        print("  [!] Naukri returned incomplete information error page.")
                         return False
                 except:
                     pass
-                return True
+                new_drawer, _ = find_active_drawer(page)
+                return not bool(new_drawer)
+            print("  [!] No actionable questions or enabled Save button found in drawer.")
+            return False
 
-        if stuck_rounds >= 3:
-            print("  [AI] No new questions detected for multiple turns. Attempting final Save...")
-            click_save_if_present(page)
-            time.sleep(2.5)
-            return True
-
-    return True
+    return False
 
 # Setup directories and files
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -567,6 +731,8 @@ applied_urls = {job.get("url") for job in applied_jobs if job.get("url")}
 def run_naukri():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Run without actually clicking submit.")
+    parser.add_argument("--target", type=int, default=999999, help="Target number of applications to submit.")
+    parser.add_argument("--unlimited", action="store_true", default=True, help="Run continuously without stopping.")
     args = parser.parse_args()
 
     with sync_playwright() as p:
@@ -578,7 +744,7 @@ def run_naukri():
             viewport={"width": 1280, "height": 800},
             args=["--start-maximized", "--disable-blink-features=AutomationControlled"]
         )
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
 
         print("\n=======================================================")
         print("1. Please apply any filters you want (Location, Experience, etc).")
@@ -597,7 +763,7 @@ def run_naukri():
         search_url = page.url
         print(f"\n[+] Starting automated application loop on: {search_url}")
 
-        target_applications = 50
+        target_applications = getattr(args, 'target', 999999)
         applications_done = 0
 
         tech_keywords = [
@@ -651,8 +817,18 @@ def run_naukri():
             if len(job_links) == 0:
                 empty_scroll_count += 1
                 if empty_scroll_count > 3:
-                    print("Reached the end of available jobs or pagination failed. Stopping.")
-                    break
+                    print("\n[♾️ Unstoppable Mode] Reached the end of available Naukri jobs.")
+                    print("  Waiting 60 seconds before cycling back to Page 1 for newly posted jobs...")
+                    for sec in range(60, 0, -1):
+                        print(f"  Resuming in {sec}s...", end="\r")
+                        time.sleep(1)
+                    empty_scroll_count = 0
+                    try:
+                        page.goto(search_url)
+                        page.wait_for_timeout(4000)
+                    except Exception:
+                        pass
+                    continue
                 print("No new jobs found on this page. Attempting to scroll...")
                 page.mouse.wheel(0, 3000)
                 page.wait_for_timeout(2000)
@@ -734,11 +910,13 @@ def run_naukri():
                     human_delay(2.0, 3.0)
 
                     try:
+                        curr_u = new_page.url.lower()
                         body_text = new_page.inner_text("body").lower()
                     except:
+                        curr_u = ""
                         body_text = ""
 
-                    if "oops" in body_text and "incomplete" in body_text:
+                    if "saveapply" in curr_u or ("oops" in body_text and "incomplete" in body_text):
                         print("  [!] Application failed: Naukri returned 'Oops! Incomplete information' error page.")
                         success = False
                     elif "successfully applied" in body_text or "applied successfully" in body_text:
@@ -749,8 +927,9 @@ def run_naukri():
                         if success:
                             try:
                                 time.sleep(2)
+                                final_u = new_page.url.lower()
                                 final_body = new_page.inner_text("body").lower()
-                                if "oops" in final_body and "incomplete" in final_body:
+                                if "saveapply" in final_u or ("oops" in final_body and "incomplete" in final_body):
                                     print("  [!] Post-chatbot error: Naukri still says incomplete information.")
                                     success = False
                             except:
@@ -782,8 +961,20 @@ def run_naukri():
                     except:
                         pass
 
-            page.mouse.wheel(0, 3000)
-            human_delay(2.0, 3.0)
+            # Advance to next page via UI pagination
+            next_btn = page.query_selector("a.fright, a.styles_btn-secondary__, span:has-text('Next'), a[rel='next'], button[class*='next'], a[class*='next'], a:has-text('Next'), a:has-text('>')")
+            if next_btn:
+                print("Advancing to Next Page on Naukri...")
+                try:
+                    next_btn.scroll_into_view_if_needed()
+                    next_btn.click(force=True)
+                    page.wait_for_timeout(4000)
+                except:
+                    page.evaluate("btn => btn.click()", next_btn)
+                    page.wait_for_timeout(4000)
+            else:
+                page.mouse.wheel(0, 3000)
+                human_delay(2.0, 3.0)
 
         print(f"\n[+] Finished. Applied to {applications_done} jobs.")
 
